@@ -1,0 +1,147 @@
+# CI/CD for the price scraper, on the self-hosted runner labelled "dev-runner".
+#
+#   build  - every push / PR to main: build the Docker image and smoke-test it.
+#   deploy - pushes to main only: replace the running container with the new
+#            image and wait for /health on port 5000.
+#
+# Both jobs run on the same machine, so deploy uses the image build just made;
+# no registry is involved.
+#
+# Repository settings needed (Settings > Secrets and variables > Actions):
+#   secrets:   DB_SERVER, DB_NAME, DB_USER, DB_PASSWORD
+#   variables: DB_ENCRYPT (default yes), DB_TRUST_SERVER_CERTIFICATE (default no),
+#              APP_PUBLISHED_PORT (default 5000)
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# One deploy at a time; a newer push cancels an older run still in progress.
+concurrency:
+  group: cicd-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: price-scraper
+  IMAGE_TAG: ${{ github.sha }}
+  CONTAINER_NAME: price-scraper
+  CONTAINER_PORT: 5000
+  PUBLISHED_PORT: ${{ vars.APP_PUBLISHED_PORT || '5000' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build & smoke test
+    runs-on: [self-hosted, dev-runner]
+    # Never run code from a fork's PR on a self-hosted runner.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Build image
+        run: |
+          docker build \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -t "${IMAGE_NAME}:${IMAGE_TAG}" \
+            .
+
+      - name: Smoke test - CLI starts
+        run: docker run --rm "${IMAGE_NAME}:${IMAGE_TAG}" --help
+
+      - name: Smoke test - dependencies and ODBC driver present
+        run: |
+          docker run --rm --entrypoint python "${IMAGE_NAME}:${IMAGE_TAG}" -c "
+          import pyodbc, app.scraper, fastapi, uvicorn
+          drivers = pyodbc.drivers()
+          print('ODBC drivers:', drivers)
+          assert 'ODBC Driver 18 for SQL Server' in drivers, 'msodbcsql18 missing'
+          "
+
+  deploy:
+    name: Deploy to dev
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, dev-runner]
+    steps:
+      - name: Write env file
+        env:
+          DB_SERVER: ${{ secrets.DB_SERVER }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_ENCRYPT: ${{ vars.DB_ENCRYPT || 'yes' }}
+          DB_TRUST_SERVER_CERTIFICATE: ${{ vars.DB_TRUST_SERVER_CERTIFICATE || 'no' }}
+        run: |
+          for name in DB_SERVER DB_NAME DB_USER DB_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Secret $name is not set"
+              exit 1
+            fi
+          done
+          # docker --env-file takes values literally (no quoting), one per line.
+          umask 077
+          {
+            echo "DB_DRIVER=ODBC Driver 18 for SQL Server"
+            echo "DB_SERVER=${DB_SERVER}"
+            echo "DB_NAME=${DB_NAME}"
+            echo "DB_TRUSTED_CONNECTION=no"
+            echo "DB_USER=${DB_USER}"
+            echo "DB_PASSWORD=${DB_PASSWORD}"
+            echo "DB_ENCRYPT=${DB_ENCRYPT}"
+            echo "DB_TRUST_SERVER_CERTIFICATE=${DB_TRUST_SERVER_CERTIFICATE}"
+          } > "${RUNNER_TEMP}/app.env"
+
+      - name: Replace running container
+        run: |
+          docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
+          docker run -d \
+            --name "${CONTAINER_NAME}" \
+            --restart unless-stopped \
+            --env-file "${RUNNER_TEMP}/app.env" \
+            -p "${PUBLISHED_PORT}:${CONTAINER_PORT}" \
+            "${IMAGE_NAME}:${IMAGE_TAG}"
+          docker tag "${IMAGE_NAME}:${IMAGE_TAG}" "${IMAGE_NAME}:latest"
+
+      - name: Wait for /health
+        run: |
+          url="http://localhost:${PUBLISHED_PORT}/health"
+          for attempt in $(seq 1 20); do
+            if curl -fsS "$url"; then
+              echo
+              echo "Healthy after ${attempt} attempt(s): $url"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::$url did not respond in time"
+          docker logs --tail 100 "${CONTAINER_NAME}"
+          exit 1
+
+      - name: Check database connectivity
+        # Reported, not fatal: the API is up even if the DB is briefly unreachable.
+        continue-on-error: true
+        run: curl -fsS "http://localhost:${PUBLISHED_PORT}/db-check"
+
+      - name: Remove env file
+        if: always()
+        run: rm -f "${RUNNER_TEMP}/app.env"
+
+      - name: Prune old images
+        if: success()
+        run: |
+          docker images "${IMAGE_NAME}" --format '{{.Tag}}' \
+            | grep -vxE "latest|${IMAGE_TAG}" \
+            | xargs -r -I{} docker rmi "${IMAGE_NAME}:{}" || true
+          docker image prune -f
