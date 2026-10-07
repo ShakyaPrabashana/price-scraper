@@ -1,4 +1,5 @@
-# CI/CD for the price scraper, on the self-hosted runner labelled "dev-runner".
+# CI/CD for the price scraper, on the self-hosted runner "dev-runner" (Windows),
+# selected by its "scraper" label: runs-on matches labels, not runner names.
 #
 #   build  - every push / PR to main: build the Docker image and smoke-test it.
 #   deploy - pushes to main only: replace the running container with the new
@@ -43,10 +44,17 @@ defaults:
 jobs:
   build:
     name: Build & smoke test
-    runs-on: [self-hosted, dev-runner]
+    runs-on: [self-hosted, scraper]
     # Never run code from a fork's PR on a self-hosted runner.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
+      # Git's bin folder is not on this machine's PATH, so plain "bash" would
+      # resolve to WSL's C:\Windows\System32\bash.exe. Put Git Bash first.
+      - name: Use Git Bash
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\Git\bin"
+
       - name: Checkout
         uses: actions/checkout@v5
 
@@ -73,8 +81,13 @@ jobs:
     name: Deploy to dev
     needs: build
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-    runs-on: [self-hosted, dev-runner]
+    runs-on: [self-hosted, scraper]
     steps:
+      - name: Use Git Bash
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\Git\bin"
+
       - name: Write env file
         env:
           DB_SERVER: ${{ secrets.DB_SERVER }}
